@@ -1,0 +1,135 @@
+import re
+import logging
+import threading
+import time
+import dns.resolver
+from collections import defaultdict
+from tqdm import tqdm
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+# Categories initialization using a dictionary
+categories = defaultdict(set)  # Use a set to automatically avoid duplicates
+processed_emails = set()  # For tracking duplicates across files
+
+# Regex pattern for email extraction and validation (supports Unicode characters)
+email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+(?:[a-zA-Z0-9._%+-]*[\u00C0-\u024F\u1E00-\u1EFF]*)@[a-zA-Z0-9.-]+\.[a-zAZ]{2,}')
+
+# Logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# Cache for MX records to prevent redundant DNS lookups
+mx_cache = {}
+
+# Function to determine the category of a domain
+def categorize_domain(domain):
+    if "gmail." in domain:
+        return "gmail"
+    elif "yahoo." in domain:
+        return "yahoo"
+    elif any(sub in domain for sub in ["hotmail.", "outlook.", "live.", "msn."]):
+        return "microsoft"
+    elif "aol." in domain:
+        return "aol"
+    else:
+        return "other"
+
+# Function to validate email format
+def is_valid_email(email):
+    return bool(email_pattern.match(email))
+
+# Function to normalize email address (lowercase)
+def normalize_email(email):
+    return email.strip().lower()
+
+# Function to check MX records (with caching to optimize performance)
+def is_valid_mx_record(domain):
+    if domain in mx_cache:
+        return mx_cache[domain]
+    
+    try:
+        dns.resolver.resolve(domain, 'MX')
+        mx_cache[domain] = True
+        return True
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        mx_cache[domain] = False
+        return False
+
+# Function to process each line of the file and save valid emails
+def process_line(line, categories):
+    global processed_emails
+    emails = email_pattern.findall(line)
+    for email in emails:
+        normalized_email = normalize_email(email)  # Normalize email address
+        if is_valid_email(normalized_email) and normalized_email not in processed_emails:
+            domain = normalized_email.split('@')[1]
+            if is_valid_mx_record(domain):  # Check MX records
+                category = categorize_domain(domain)
+                categories[category].add(normalized_email)  # Add email to the category set
+                processed_emails.add(normalized_email)  # Track the email across files
+                save_valid_email(normalized_email, category)  # Save the valid email to the category-based file
+            else:
+                logging.warning(f"Invalid MX record for {email}, skipping.")
+
+# Function to save valid email to a file with dynamic filenames
+def save_valid_email(email, category):
+    """Save valid email to a file with dynamic filename based on the category and timestamp."""
+    current_date = datetime.now().strftime("%Y-%m-%d")  # Get current date in Year-Month-Day format
+    output_file = f"{category}_domains_{current_date}.txt"  # Dynamic filename with date
+    with open(output_file, 'a') as file:
+        file.write(f"{email}\n")
+    logging.info(f"Saved valid email to {output_file}: {email}")
+
+# Function to read file with multiple encodings
+def read_file_with_encodings(file_path):
+    encodings = ['utf-8', 'latin-1', 'ISO-8859-1']
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as file:
+                return file.readlines()
+        except UnicodeDecodeError:
+            logging.warning(f"Failed to decode the file using {encoding}. Trying another encoding...")
+        except FileNotFoundError:
+            logging.error(f"Error: The file {file_path} was not found.")
+            raise
+    logging.error("Failed to read the file with all tried encodings.")
+    raise Exception("Unable to read the file with the available encodings.")
+
+# Real-Time Progress Monitoring using tqdm
+def process_file_with_progress(file_path, categories):
+    lines = read_file_with_encodings(file_path)
+    total_lines = len(lines)
+    valid_email_count = 0  # Counter for valid emails
+
+    with tqdm(total=total_lines, desc="Processing emails", unit="line") as pbar:
+        # Use ThreadPoolExecutor for concurrent processing
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(process_line, line, categories) for line in lines]
+            for future in futures:
+                future.result()  # Wait for task completion
+                valid_email_count += 1  # Increment if a valid email is processed
+                pbar.set_postfix(valid_emails=valid_email_count)  # Show valid email count on progress bar
+                pbar.update(1)
+
+# Main function to prompt for the file path and start processing
+def main():
+    input_file = input("Please enter the file path: ")  # Prompt for file path
+    start_time = time.time()  # Start the timer
+
+    try:
+        process_file_with_progress(input_file, categories)
+
+        # Print processing time statistics
+        end_time = time.time()
+        processing_time = end_time - start_time
+        logging.info(f"Total processing time: {processing_time:.2f} seconds.")
+        
+        # Summary of categorized emails
+        for category, email_set in categories.items():
+            logging.info(f"{category.capitalize()}: {len(email_set)} emails processed.")
+    
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+
+if __name__ == "__main__":
+    main()
